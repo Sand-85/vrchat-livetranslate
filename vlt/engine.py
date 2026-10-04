@@ -507,15 +507,14 @@ class Engine:
 
         # ---- 出网端点（打字翻译 / 打字译音）：从 base_url 的 host 派生，启动时算一次并缓存 ----
         # 单一真相源 = session.base_url（见 vlt/endpoints.py 的「宿主派生」口径）：这里派生出
-        # 另外两条 HTTP 端点，绝不在别处再写一份域名。派生失败（base_url 带 {workspace_id}
-        # 占位符却没填 workspace_id 之类）→ **留痕**并回落千问云默认端点，绝不让 Engine 构造
-        # 就崩；真正连接时实时那条腿会用 SessionConfig.url 再报一次明确错误。
+        # 另外两条 HTTP 端点，绝不在别处再写一份域名。派生失败（手写的 base_url 缺 scheme
+        # 之类）→ **留痕**并回落千问云默认端点，绝不让 Engine 构造就崩；真正连接时实时那条腿
+        # 会用 SessionConfig.url 再报一次明确错误。
         sb = cfg.session_base or {}
         base_url = sb.get("base_url") or endpoints.default_base_url(endpoints.DEFAULT_PROVIDER)
-        ws_id = sb.get("workspace_id") or ""
         try:
-            self._chat_endpoint = endpoints.chat_url(base_url, ws_id)
-            self._tts_endpoint = endpoints.multimodal_url(base_url, ws_id)
+            self._chat_endpoint = endpoints.chat_url(base_url)
+            self._tts_endpoint = endpoints.multimodal_url(base_url)
         except ValueError as exc:
             print(f"[net] ⚠️ 出网端点派生失败（{exc}）→ 打字翻译/译音回落千问云默认端点",
                   flush=True)
@@ -801,9 +800,8 @@ class Engine:
         scfg = self._cfg.directions[self._direction].to_session_config(self._cfg.session_base)
 
         # 宿主 + 线路必须留痕：换线路排查时第一眼要看它（describe 内部对 host 解析失败会降级，
-        # 空间 ID 只打前缀、绝不打完整值，key 更不出现）。
-        print(f"[net] {endpoints.describe(scfg.provider, scfg.region, scfg.base_url, scfg.workspace_id)}",
-              flush=True)
+        # key 绝不出现）。
+        print(f"[net] {endpoints.describe(scfg.provider, scfg.base_url)}", flush=True)
 
         if "chatbox" in self._sinks and not self._chatbox_wanted:
             msg = ("chatbox 只发『我说的话』的译文"
