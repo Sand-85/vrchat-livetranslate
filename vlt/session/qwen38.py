@@ -92,7 +92,10 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         self._buf: list[str] = []          # 本段已确认文本的增量累加
         self._src_buf: list[str] = []
         self._last_text_at: float = 0.0    # 最近一次文本增量时间（静默兜底用）
-        self._last_audio_at: float = 0.0   # 最近一次**上送音频**时刻（快封句的「麦克风静音」依据）
+        self._last_voice_at: float = 0.0   # 最近一次**听到人声**的时刻（快封句的音频侧依据）
+        # 本段（= 本次 response）里是否听到过人声：没听到就不许走快路径（保守兜底，
+        # 见 base.should_finalize 的 `voiced`）。由 response.created 重置。
+        self._voiced_in_utterance = False
         self._last_final_text = ""         # 最近一次已发出的最终版文本（允许再次终结）
         self._budget = ConnectionBudget(cfg.max_new_sessions_per_minute)
         # 延迟埋点
@@ -150,14 +153,21 @@ class QwenLiveTranslateSession(LiveTranslateSession):
     async def send_audio(self, pcm16_16k: bytes) -> None:
         if self._ws is None:
             raise RuntimeError("会话尚未 start()")
-        # 快封句的「麦克风静音」依据：注意引擎的 _SilenceGate 静音时**只暂停上送**，
-        # 所以「距上次上送的间隔」就是用户真实的停顿长度。
-        self._last_audio_at = time.perf_counter()
         await self._ws.send(json.dumps({
             "event_id": "evt_audio",
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(pcm16_16k).decode(),
         }))
+
+    def note_voice(self) -> None:
+        """采集侧刚在这条腿的上行音频里听到人声（见 `base.LiveTranslateSession.note_voice`）。
+
+        ⚠️ 这里**不能**用「距上次 send_audio 的间隔」代替：采集腿每块都发，
+        那个量恒为 ~0.1s（PR #49 的阻断项就是死在这）。判据必须在采集侧按电平算，
+        见 `vlt/voice_activity.py` + `engine._SessionProxy.send_audio`。
+        """
+        self._last_voice_at = time.perf_counter()
+        self._voiced_in_utterance = True
 
     @property
     def is_alive(self) -> bool:
@@ -296,6 +306,9 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             return
         if etype == "response.created":
             self._buf.clear()
+            # 新的一段话开始了：本段的「听到过人声吗」重新计。判据只有在本段里
+            # 真听到你说过话才允许走快路径（见 base.should_finalize 的 `voiced`）。
+            self._voiced_in_utterance = False
             return
 
         # --- 归一化文本（按代次分派）---
@@ -348,15 +361,21 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         2026-10-01 实测补充（真链路 2 句）：**停止上送后的 8s 内服务端一条事件都不发**
         （既无 text.done 也无 response.done）→ 没有语义信号可用，只能靠定时器；
         而累计译文在「说完前 0.74~0.89s」就不再增长 → 之后再等 3s 全是白等。
-        故加上**双条件快封句**：麦克风也静了（用户确实说完）时，文字静默 1.1s 就封，
-        实测把终版从「说完后 +2.1s」提到 **+0.3s**（省 ~1.8s）。判据在
-        `base.should_finalize()`（纯函数，离线可测）。
+        故加上**双条件快封句**：上行音频也静了（人确实说完了）时，文字静默 1.1s 就封。
 
-        注意三点（都是实测踩出来的）：
+        ⚠️ 2026-10-04 修正（审核打回 + 复现）：音频侧判据原先取的是「距上次
+        `send_audio` 的间隔」，而采集腿每块都发 → 那个量恒为 ~0.1s，快路径从未触发
+        （链路级用例 `tests/test_fast_finalize_chain.py` 断言：静音期 0.124s / 阈值 0.6s）。
+        现在它由采集侧按**块电平相对噪声底**判定后经 `note_voice()` 送进来
+        （见 vlt/voice_activity.py）——「上行音频静了多久」才第一次真正可用。
+
+        注意四点（都是实测踩出来的）：
         1) 慢阈值必须大于服务端的增量间隔（实测最大 2.3s），否则会在句子中间抢跑；
         2) **不能一发就永久封死**——长句后续还会有增量，文本变了就应再次终结；
-        3) 那 2.3s 的大间隔是**句子中间**的停顿 → 快路径必须有「麦克风已静」这一条，
-           否则照样会抢跑。
+        3) 那 2.3s 的大间隔是**句子中间**的停顿 → 快路径必须有「音频已静」这一条，
+           否则照样会抢跑；
+        4) 本段**没听到过人声**时（`voiced=False`：麦被静音/增益过低/太小声）只走慢路径 ——
+           证明不了「你说完了」就别抢跑。
         """
         if self._closing or not self._buf:
             return
@@ -367,11 +386,12 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             return
         now = time.perf_counter()
         text_quiet = now - self._last_text_at
-        mic_quiet = (now - self._last_audio_at) if self._last_audio_at else None
-        if should_finalize(text_quiet_s=text_quiet, mic_quiet_s=mic_quiet,
+        audio_quiet = (now - self._last_voice_at) if self._last_voice_at else None
+        if should_finalize(text_quiet_s=text_quiet, audio_quiet_s=audio_quiet,
                            silence_s=self.cfg.final_silence_s,
                            fast_silence_s=self.cfg.fast_final_silence_s,
-                           fast_mic_quiet_s=self.cfg.fast_final_mic_quiet_s):
+                           fast_quiet_s=self.cfg.fast_final_audio_quiet_s,
+                           voiced=self._voiced_in_utterance):
             self._emit(confirmed=cur, pending="", is_final=True)
 
     def _map_text_event(self, etype: str, ev: dict) -> tuple[str, str, str | None] | None:

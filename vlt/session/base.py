@@ -40,37 +40,56 @@ class TextDelta:
 # 阈值太小会在句子中间抢跑，把半句当成最终版。
 DEFAULT_FINAL_SILENCE_S = 3.0
 
-# 「麦克风也静了」的快封句（真链路实测 2026-10-01：省 ~1.8s）：
+# 「上行音频也静了」的快封句（真链路实测 2026-10-01：省 ~1.8s）：
 # 实测（真链路 2 句）：服务端在**用户停止说话后 8s 内一条事件都不发**
 # （既无 response.text.done 也无 response.done）→ 没有语义完成信号可用，只能靠定时器；
 # 而累计译文在「说完前 0.74~0.89s」就不再增长 → 之后再等 3s 全是白等。
-# 所以：**麦克风已静音 ≥ fast_mic_quiet_s**（用户确实说完了）时，文字静默只要
-# fast_silence_s 就封句；用户还在说（< fast_mic_quiet_s）则仍用保守的 3.0s —— 那 2.3s 的
+# 所以：**上行音频已静 ≥ fast_quiet_s**（用户确实说完了）时，文字静默只要
+# fast_silence_s 就封句；用户还在说（< fast_quiet_s）则仍用保守的 3.0s —— 那 2.3s 的
 # 大间隔是**句子中间**的停顿，不能拿它当证据。
+#
+# ⚠️ 「上行音频静了」这个量**不是**「距上次上送音频的间隔」（第一版就死在这里：
+#    采集腿每块都发，那个量恒为 ~0.1s），也**不是** `peak >= SILENCE_PEAK`
+#    （太低，把房间噪声也算成有声）。它是按块 RMS 电平相对**噪声底**判的
+#    「有没有人在说」，见 vlt/voice_activity.py + engine._SessionProxy.send_audio。
+#
+# ⚠️ 另一条腿（loopback = 别人说）共用这段逻辑：那边同一个量含义是
+#    「VRChat 输出静了」。开着输入门限时，被门限拦掉的块根本到不了判据这一层，
+#    于是音频侧会自然「静」下来 —— 行为一致，不会顶死。
 DEFAULT_FAST_FINAL_SILENCE_S = 1.1
-DEFAULT_FAST_FINAL_MIC_QUIET_S = 0.5
+# 音频侧阈值取 > fast_silence_s：这样**起决定作用的是「你的声音真的消失了多久」**，
+# 而不是只看文字侧那 1.1s（换气/想词的中途停顿也可能让文字停止增长 ≥1.1s）。
+# 1.5s 是给自然停顿留的余量；调小更激进（更快封句，也更容易把半句封成终版）。
+DEFAULT_FAST_FINAL_AUDIO_QUIET_S = 1.5
 
 
-def should_finalize(*, text_quiet_s: float, mic_quiet_s: float | None,
+def should_finalize(*, text_quiet_s: float, audio_quiet_s: float | None,
                     silence_s: float = DEFAULT_FINAL_SILENCE_S,
                     fast_silence_s: float | None = DEFAULT_FAST_FINAL_SILENCE_S,
-                    fast_mic_quiet_s: float = DEFAULT_FAST_FINAL_MIC_QUIET_S) -> bool:
+                    fast_quiet_s: float = DEFAULT_FAST_FINAL_AUDIO_QUIET_S,
+                    voiced: bool = True) -> bool:
     """该不该把累计文本封成「最终版」（纯函数，便于离线测）。
 
     两条路径：
     - **慢**：文字静默 ≥ `silence_s`（3.0s）。任何时候都成立，但用户说完后要白等 3s。
-    - **快**：`fast_silence_s` 非 None、**麦克风已静音 ≥ `fast_mic_quiet_s`**、
-      且文字静默 ≥ `fast_silence_s`。用户都不说了，服务端的尾巴（实测最后一条分片在
-      说完前 0.7~0.9s 就到齐）就不会再长 → 可以早封。
+    - **快**：`fast_silence_s` 非 None、**本段确实听到过人声**（`voiced`）、
+      **上行音频已静 ≥ `fast_quiet_s`**、且文字静默 ≥ `fast_silence_s`。
+      人都不说了，服务端的尾巴（实测最后一条分片在说完前 0.7~0.9s 就到齐）就不会再长。
 
-    `mic_quiet_s=None`：从未上送过音频（没有音频在流 = 没人在说话）→ 按「已静」看待。
+    `voiced=False`（本段没听到过人声）：**只走慢路径**。这是保守方向的兜底 ——
+    麦克风被静音、增益过低、或小声到判据认不出来时，我们无法证明「你说完了」，
+    那就别抢跑，宁可多等那 3s。
+
+    `audio_quiet_s=None`：从未上送过音频（没有音频在流 = 没人在说话）→ 按「已静」看待。
     """
     if text_quiet_s >= silence_s:
         return True
     if fast_silence_s is None:
         return False
-    if mic_quiet_s is not None and mic_quiet_s < fast_mic_quiet_s:
-        return False                      # 用户还在说：服务端可能只是慢，别抢跑
+    if not voiced:
+        return False                      # 本段没听到人声：判据不成立，绝不抢跑
+    if audio_quiet_s is not None and audio_quiet_s < fast_quiet_s:
+        return False                      # 人还在说：服务端可能只是慢，别抢跑
     return text_quiet_s >= fast_silence_s
 
 
@@ -99,10 +118,12 @@ class SessionConfig:
     # ⚠️ 必须大于服务端的「增量间隔」：实测连续说话时相邻 delta 可间隔 2.3s，
     #    阈值太小会在句子中间抢跑，把半句当成最终版。
     final_silence_s: float = DEFAULT_FINAL_SILENCE_S
-    # 快封句（麦克风也静了 → 用户确实说完了）：文字静默到这个值就封，省 ~1.8s。
+    # 快封句（上行音频也静了 → 用户确实说完了）：文字静默到这个值就封，省 ~1.8s。
     # None = 关掉快路径（退回纯 final_silence_s）。
     fast_final_silence_s: float | None = DEFAULT_FAST_FINAL_SILENCE_S
-    fast_final_mic_quiet_s: float = DEFAULT_FAST_FINAL_MIC_QUIET_S
+    # 音频侧阈值（见 should_finalize）：取 > fast_final_silence_s，
+    # 让「你的声音真的消失了多久」起决定作用，而不是只看文字侧那 1.1s。
+    fast_final_audio_quiet_s: float = DEFAULT_FAST_FINAL_AUDIO_QUIET_S
 
     @property
     def url(self) -> str:
@@ -128,6 +149,14 @@ class LiveTranslateSession(abc.ABC):
         self.on_usage: UsageHandler | None = None
         # 原始服务端事件钩子（调试/埋点用）：(event_type, full_event) -> None
         self.on_event = None
+
+    def note_voice(self) -> None:
+        """采集侧刚在这条腿的**上行音频**里听到人声。
+
+        默认空实现：只有拿它当判据的会话才覆盖（`qwen38` 用它算「上行音频静了多久」，
+        是「快封句」的双条件之一，见 `base.should_finalize`）。
+        语义按腿而定：麦克风腿 = 「你在说」，loopback 腿 = 「VRChat 输出里有声音」。
+        """
 
     @abc.abstractmethod
     async def start(self, on_text: TextHandler, on_audio: AudioHandler | None = None,

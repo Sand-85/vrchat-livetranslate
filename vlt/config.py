@@ -13,7 +13,7 @@ import yaml
 
 from . import endpoints
 from .session.base import (SessionConfig, DEFAULT_FINAL_SILENCE_S,
-                           DEFAULT_FAST_FINAL_SILENCE_S, DEFAULT_FAST_FINAL_MIC_QUIET_S)
+                           DEFAULT_FAST_FINAL_SILENCE_S, DEFAULT_FAST_FINAL_AUDIO_QUIET_S)
 
 from .paths import APP_DIR, BUNDLE_DIR
 
@@ -143,12 +143,14 @@ class Direction:
             reconnect_backoff=tuple(base.get("reconnect_backoff", (2, 5, 10, 30))),
             max_new_sessions_per_minute=int(base.get("max_new_sessions_per_minute", 4)),
             final_silence_s=float(base.get("final_silence_s", DEFAULT_FINAL_SILENCE_S)),  # 默认值必须 > 服务端增量间隔（实测最大 2.3s），改小会让最终版在句子中间抢跑
-            # 快封句（麦克风也静了 → 用户确实说完了）：文字静默到这个值就封，省 ~1.8s；
-            # None = 关掉快路径（退回纯 final_silence_s）
+            # 快封句（上行音频也静了 → 人确实说完了）：文字静默到这个值就封，省 ~1.8s；
+            # None/空串 = **明确关掉**快路径（退回纯 final_silence_s）；非法值留痕后回落默认
             fast_final_silence_s=_opt_float(
-                base.get("fast_final_silence_s", DEFAULT_FAST_FINAL_SILENCE_S)),
-            fast_final_mic_quiet_s=float(
-                base.get("fast_final_mic_quiet_s", DEFAULT_FAST_FINAL_MIC_QUIET_S)),
+                base.get("fast_final_silence_s", DEFAULT_FAST_FINAL_SILENCE_S),
+                key="fast_final_silence_s", default=DEFAULT_FAST_FINAL_SILENCE_S),
+            fast_final_audio_quiet_s=_pos_float(
+                base.get("fast_final_audio_quiet_s", DEFAULT_FAST_FINAL_AUDIO_QUIET_S),
+                key="fast_final_audio_quiet_s", default=DEFAULT_FAST_FINAL_AUDIO_QUIET_S),
         )
 
 
@@ -185,18 +187,40 @@ class AppConfig:
         return merge_hotwords(self.session_base.get("glossary"), d.hotwords if d else None)
 
 
-def _opt_float(value) -> float | None:
-    """可选浮点字段：`None`/空串 → `None`（= **关掉**该功能）；非法值也回 `None`。
+def _opt_float(value, *, key: str, default: float | None) -> float | None:
+    """可选浮点字段：`None`/空串 → `None`（= 用户**明确关掉**该功能）。
 
-    本仓库的配置是手写的，写错一个字母不该让程序起不来（与 `normalize_provider` 同一取舍）；
-    但「关掉」必须能表达 —— 快封句就靠 `fast_final_silence_s: null` 退回纯 `final_silence_s`。
+    ⚠️ 非法值**不留静默**：写错一个字母不该让程序起不来（与本文件其它取舍一致），
+    但也不能像第一版那样悄悄回 `None` —— 那等于「用户想开、程序默默关掉，日志里一个字没有」，
+    本仓库的既有纪律是「非法值必须留痕再回落」（见 `engine.silence_gate_settings` /
+    `repeat_guard_settings`）。所以非法值 = **留痕 + 回落 `default`**。
     """
-    if value is None or value == "":
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
         return float(value)
     except (TypeError, ValueError):
-        return None
+        print(f"[config] ⚠️ session.{key}={value!r} 非法（应为数字；设成 null/空串才是「关掉」）"
+              f"→ 回落默认值 {default!r}", flush=True)
+        return default
+
+
+def _pos_float(value, *, key: str, default: float) -> float:
+    """必填浮点字段：非法 / 非正 → **留痕 + 回落默认值**（与 `_opt_float` 同一口径）。
+
+    第一版这里用的是裸 `float()`：一个笔误会让程序**起不来**，而旁边的 `_opt_float`
+    却是静默 `None` —— 两种口径并存，都不对。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        print(f"[config] ⚠️ session.{key}={value!r} 非法（应为数字）→ 回落默认值 {default!r}",
+              flush=True)
+        return default
+    val = float(value)
+    if val <= 0:
+        print(f"[config] ⚠️ session.{key}={value!r} 非法（必须 > 0）→ 回落默认值 {default!r}",
+              flush=True)
+        return default
+    return val
 
 
 def _resolve_api_key(api_key: str | None, require_key: bool, slot: str = "qianwen") -> str:
@@ -298,11 +322,17 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         "reconnect_backoff": s.get("reconnect_backoff", [2, 5, 10, 30]),
         "max_new_sessions_per_minute": s.get("max_new_sessions_per_minute", 4),
         "final_silence_s": float(s.get("final_silence_s", DEFAULT_FINAL_SILENCE_S)),  # 默认值必须 > 服务端增量间隔（实测最大 2.3s），改小会让最终版在句子中间抢跑
-        # 快封句：麦克风也静了 → 文字静默 fast_final_silence_s 就封（省 ~1.8s）；None = 关掉
+        # 快封句：上行音频也静了 → 文字静默 fast_final_silence_s 就封（省 ~1.8s）；
+        # None/空串 = 明确关掉；非法值留痕后回落默认（绝不静默关掉用户想开的功能）
         "fast_final_silence_s": _opt_float(
-            s.get("fast_final_silence_s", DEFAULT_FAST_FINAL_SILENCE_S)),
-        "fast_final_mic_quiet_s": float(
-            s.get("fast_final_mic_quiet_s", DEFAULT_FAST_FINAL_MIC_QUIET_S)),
+            s.get("fast_final_silence_s", DEFAULT_FAST_FINAL_SILENCE_S),
+            key="fast_final_silence_s", default=DEFAULT_FAST_FINAL_SILENCE_S),
+        "fast_final_audio_quiet_s": _pos_float(
+            s.get("fast_final_audio_quiet_s", DEFAULT_FAST_FINAL_AUDIO_QUIET_S),
+            key="fast_final_audio_quiet_s", default=DEFAULT_FAST_FINAL_AUDIO_QUIET_S),
+        # 音频侧判据的余量：原样透传，取值校验在 engine 里做（非法值留痕 + 回落默认，
+        # 见 engine.voice_margin_settings）
+        "fast_final_voice_margin_db": s.get("fast_final_voice_margin_db", None),
         # 长静音闸门 + 本地 repeat 抑制：原样透传，取值校验在 engine 里做
         # （非法值会**留痕**并回落默认值，见 engine.silence_gate_settings / repeat_guard_settings）
         "silence_gate_enabled": s.get("silence_gate_enabled", True),
