@@ -141,19 +141,23 @@ class LiveTranslateSession(abc.ABC):
         self._last_voice_at: float = 0.0
 
     def note_voice(self) -> None:
-        """上游告诉会话：**刚刚这一块音频是「有人在说话」**（电平过 `SILENCE_PEAK`）。
+        """上游告诉会话：**刚刚这一块音频里有「人在说话」**。
 
         只给静默兜底用（`tick()` 的快路径判据）。谁调用：`engine._SessionProxy.send_audio`
-        —— 它本来就在算 `loud = peak >= SILENCE_PEAK`，顺手把「有人在说」上报给会话。
-
-        ⚠️ 判据为什么不能用「距上次上送音频的间隔」：麦克风腿**没有闸门**（静音块照样
-        每 ~0.1s 上送一次，`_SilenceGate` 只挂在环回腿、阈值默认 30s）→ 那个间隔恒为
-        ~0.1s，快路径永不触发（实测脚本 `out/check_pr49_mic_signal.py`）。
+        —— 它按**块电平相对噪声底**判定「这条腿的上游有没有人在说」（`vlt/voice_activity.py`），
+        判到了才上报；⚠️ 不能用 `peak >= SILENCE_PEAK`（那条门限低到把房间噪声也算成有声
+        → 「上游已静」永远不成立、快路径静默失效），也不能用「距上次上送音频的间隔」
+        （静音块照样每 ~0.1s 上送一次，那个间隔恒为 ~0.1s）。
         """
         self._last_voice_at = time.perf_counter()
 
     def user_quiet_s(self, now: float | None = None) -> float | None:
-        """距上游最后一次「有人说话」过去多久；这条腿全程没声音 → `None`（按「已静」看待）。"""
+        """距上游最后一次「有人说话」过去多久；这条腿全程没声音 → `None`（按「已静」看待）。
+
+        ⚠️ `None` 的含义是「**从没收到过**有人在说话的信号」——判据那边必须当**保守**处理
+        （走 3.0s 慢路径），不能当「已经静了很久」：麦被静音/增益过低时就是这个状态，
+        那时没有任何信号能证明「你说完了」。
+        """
         if not self._last_voice_at:
             return None
         return (now if now is not None else time.perf_counter()) - self._last_voice_at

@@ -287,7 +287,8 @@ session:
   turn_detection: null        # 留空 = 服务端默认
   final_silence_s: 3.0        # ⚠️ 必须 > 服务端增量间隔（实测最大 2.3s），调小会让最终版在句子中间抢跑
   fast_final_silence_s: 1.1   # 快封句：上游也静了（没人说话了）时，文字静默这么久就封，省 ~1.8s；null = 关掉
-  fast_final_user_quiet_s: 0.5  # 「没人说话」的判据 = **电平**；环境噪声长期高过阈值时快路径自动退化成上面那 3.0s
+  fast_final_user_quiet_s: 0.5  # 「没人说话」的判据 = **块电平相对噪声底**（不是固定峰值门限）；麦静音/增益过低时退化成上面那 3.0s
+  fast_final_voice_margin_db: 10.0  # 判据余量：块电平高出估计的噪声底这么多 dB 才算「有人说话」（3~30）
   max_new_sessions_per_minute: 4   # RPM 10 预算：每次 WS 连接算一次请求
   reconnect_backoff: [2, 5, 10, 30]
 
@@ -566,7 +567,7 @@ Nekoya=猫屋
 | `Invalid translation parameter` | `session.update` 缺 `translation` 字段（代码里已保证，改代码时注意） |
 | `1007 Requests rate limit exceeded` | 撞了 RPM 10。等 1 分钟；别频繁重启（**每次 WS 连接都算一次请求**） |
 | 译文停在半句话上 | 静默兜底阈值被调小了。`session.final_silence_s` 必须 > 2.3s，默认 3.0 |
-| 说完后要等 ~3s 才出最终版 | 快封句被关掉了（`session.fast_final_silence_s: null`）或没生效：找日志里的 `上游静默`；环境很吵时电平长期超阈会让快路径退化成慢路径（保守，不抢跑） |
+| 说完后要等 ~3s 才出最终版 | 快封句被关掉了（`session.fast_final_silence_s: null`）或没生效：找日志里的 `上游静默`；麦被系统静音 / 增益过低 / 说话太小声时判据认不出人声，会退化成慢路径（保守，不抢跑） |
 | `[overlay] ⚠️ SteamVR 未运行或不可用` | 正常降级：只有手腕屏不显示，chatbox 不受影响 |
 | 手腕屏看不见 | 先确认 SteamVR 在跑；再调「设置 → 手腕屏」里的位置 / 大小；`--overlay-dry-run` 能出 PNG 说明渲染没问题 |
 | 手腕屏过一阵子消失 | 已带两级自愈（连续 3 次失败重建 overlay → 再 3 次失败硬重启 openvr 连接 → 之后每 50 次重试一次）。日志每 30s 有一条 `[overlay][diag] 心跳：…` 可以看「最后成功上传多久前 / 重建次数」 |

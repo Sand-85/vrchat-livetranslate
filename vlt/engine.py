@@ -36,6 +36,8 @@ from .tts import DEFAULT_MODEL as DEFAULT_TTS_MODEL
 from .tts import DEFAULT_TIMEOUT_S as DEFAULT_TTS_TIMEOUT_S
 from .tts import DEFAULT_VOICE as DEFAULT_TTS_VOICE
 from .tts import TtsError, TtsStreamTruncated, synthesize, synthesize_stream
+from .voice_activity import (DEFAULT_VOICE_MARGIN_DB, VOICE_MARGIN_MAX_DB,
+                             VOICE_MARGIN_MIN_DB, VoiceActivity)
 
 ROOT = Path(__file__).resolve().parent.parent
 CHUNK_BYTES = 3200          # 100ms @16kHz s16le mono
@@ -48,7 +50,10 @@ SENTENCE_GAP_S = 0.6
 CHATBOX_DRAIN_BUDGET_S = 2.0
 CHATBOX_DRAIN_TICK_S = 0.05     # 隔一会儿再问一次令牌桶；刻意不与 min_gap_s 耦合
 
-# 输入音量判「有声音」的峰值门限（16k s16le）。只用于黑匣子统计，不影响功能。
+# 输入音量判「有声音」的峰值门限（16k s16le）。只用于黑匣子统计 + 30s 长静音闸门，
+# **不要拿它当「有没有人在说」的判据**：220 ≈ -43.5dBFS 峰值，低到把房间噪声也算成
+# 有声（实测噪声底 ≥ -50dBFS 的机器上，静音块峰值中位数就有 363 > 220 → 判据被顶死）。
+# 快封句的电平判据走相对噪声底，见 vlt/voice_activity.py。
 SILENCE_PEAK = 220
 
 # Linux 采集 VRChat 输出流时，每隔这么久回查一次 PipeWire 图 ——
@@ -119,6 +124,32 @@ def silence_gate_settings(base: dict | None) -> tuple[bool, float, float]:
               f"silence_gate_after_s={after} → 回落默认值 1.0", flush=True)
         preroll = min(1.0, after)
     return enabled, after, preroll
+
+
+def voice_margin_settings(base: dict | None) -> float:
+    """读取并校验「快封句」电平判据的余量（纯函数，离线可测）。
+
+    `session.fast_final_voice_margin_db`：块电平要高出**噪声底**多少 dB 才算
+    「有人在说」（判据本体在 `vlt/voice_activity.py`）。非数字 / 越界一律
+    **留痕 + 回落默认** —— 与本文件其它设置同一纪律：绝不静默带病运行。
+    （为什么不用 `peak >= SILENCE_PEAK`：那条门限低到把房间噪声也算成有声，
+    会静默失效。实测与说明见 voice_activity 的模块 docstring。）
+    """
+    base = base or {}
+    raw = base.get("fast_final_voice_margin_db", DEFAULT_VOICE_MARGIN_DB)
+    if raw is None:                       # 没配（配置里是空）→ 静默用默认值，不算错
+        return DEFAULT_VOICE_MARGIN_DB
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        _warn_default("fast_final_voice_margin_db", raw, "应为数字",
+                      DEFAULT_VOICE_MARGIN_DB)
+        return DEFAULT_VOICE_MARGIN_DB
+    val = float(raw)
+    if not (VOICE_MARGIN_MIN_DB <= val <= VOICE_MARGIN_MAX_DB):
+        _warn_default("fast_final_voice_margin_db", raw,
+                      f"应在 {VOICE_MARGIN_MIN_DB:g}~{VOICE_MARGIN_MAX_DB:g}dB 之间",
+                      DEFAULT_VOICE_MARGIN_DB)
+        return DEFAULT_VOICE_MARGIN_DB
+    return val
 
 
 def chunk_level_db(chunk: bytes) -> float:
@@ -371,6 +402,10 @@ class _SessionProxy:
         en, after_s, preroll_s = silence_gate_settings(
             getattr(engine._cfg, "session_base", None))          # noqa: SLF001
         self._gate = _SilenceGate(enabled=en, after_s=after_s, preroll_s=preroll_s)
+        # 「有没有人在说」的判据（快封句用）：块电平**相对噪声底**，自动适应麦克风增益
+        # 与房间噪声。每个引擎（= 每条腿）一份，跨重连保持连续 —— 噪声底不该每次重连重学。
+        self._voice = VoiceActivity(margin_db=voice_margin_settings(
+            getattr(engine._cfg, "session_base", None)))         # noqa: SLF001
 
     async def send_audio(self, pcm: bytes) -> None:
         eng = self._engine
@@ -387,13 +422,18 @@ class _SessionProxy:
         loud = peak >= SILENCE_PEAK
         if loud:
             eng._last_loud_ts = time.monotonic()     # noqa: SLF001
-            # 顺手把这声「有人在说」上报给会话：静默兜底的快路径靠它判断「上游已无人在说话」
-            # （⚠️ 不能拿「距上次上送音频的间隔」代替 —— 麦克风腿没有闸门，静音块照样
-            #   每 ~0.1s 上送一次，那个间隔恒为 ~0.1s；见 session/base.note_voice 的说明）。
-            self._note_voice()
         else:
             self.silent_chunks += 1
             eng._silent_chunks += 1                  # noqa: SLF001
+        # —— 「这条腿的上游有没有人在说」：按 RMS 电平**相对噪声底**判（不是上面那个
+        #    峰值门限 —— 220 ≈ -43.5dBFS，低到把房间噪声也算成有声；也不是「距上次上送
+        #    音频的间隔」—— 静音块照样每 ~0.1s 上送一次，那个间隔恒为 ~0.1s）。
+        #    判到了就上报给会话，静默兜底的快路径靠它判断「上游已无人在说话」。
+        #    ⚠️ 噪声底预热期的「有人在说」只是保守占位，**不当作听到了人声**：否则麦被
+        #    静音时也会被算成「刚有人说过话」，快路径反而会抢跑。
+        voice = self._voice.feed(chunk_level_db(pcm))
+        if voice and self._voice.ready:
+            self._note_voice()
         # —— 长静音闸门：连续静音超阈值就暂停上送（闸住期间只留 preroll），
         #    声音恢复时先补发 preroll、再上送当前块 —— 绝不丢句首。
         #    闸住的块不算 sent_bytes（本来就没发），诊断里有 gate 自己的计数。

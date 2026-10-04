@@ -320,6 +320,9 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         "fast_final_user_quiet_s": _float_or_default(
             s.get("fast_final_user_quiet_s", DEFAULT_FAST_FINAL_USER_QUIET_S),
             DEFAULT_FAST_FINAL_USER_QUIET_S, key="session.fast_final_user_quiet_s"),
+        # 音频侧判据的余量（块电平要高出**噪声底**多少 dB 才算「有人在说」）：
+        # 原样透传，取值校验在 engine 里做（非法值留痕 + 回落默认，见 engine.voice_margin_settings）
+        "fast_final_voice_margin_db": s.get("fast_final_voice_margin_db", None),
         # 长静音闸门 + 本地 repeat 抑制：原样透传，取值校验在 engine 里做
         # （非法值会**留痕**并回落默认值，见 engine.silence_gate_settings / repeat_guard_settings）
         "silence_gate_enabled": s.get("silence_gate_enabled", True),

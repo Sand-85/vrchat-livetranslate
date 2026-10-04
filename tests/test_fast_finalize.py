@@ -8,12 +8,22 @@
 就不再增长 → 那 3s 全是白等。所以给静默兜底加一条**快路径**：文字静默 ≥1.1s 且
 **上游也没有人在说话** ≥0.5s → 立刻封句。
 
-⚠️ 「上游没有人在说话」这个信号**必须用「电平」**（`_SessionProxy` 已经在算的
-`peak >= SILENCE_PEAK` → `session.note_voice()`），**不能**用「距上次上送音频的间隔」：
-麦克风腿没有闸门（`_SilenceGate` 只挂在环回腿上、阈值默认 30s），人说话时静音块照样
-每 ~0.1s 上送一次 → 那个间隔恒为 ~0.1s，快路径永远不触发（实测：
-`out/check_pr49_mic_signal.py`：连续喂 4s 静音，间隔最大 0.113s）。
-本文件第 3 条用例就是钉这个：**用真实 `_SessionProxy` 喂静音块，`user_quiet_s()` 不许长大**。
+⚠️ 「上游没有人在说话」这个信号**必须用「电平」**，且必须**相对噪声底**：
+
+1. 不能用「距上次上送音频的间隔」—— 麦克风腿没有闸门（`_SilenceGate` 只挂在环回腿上、
+   阈值默认 30s），人说话时静音块照样每 ~0.1s 上送一次 → 那个间隔恒为 ~0.1s，
+   快路径永远不触发（#49 的阻断项，见 §「代理」那条用例）。
+2. 也不能用固定峰值门限（`peak >= SILENCE_PEAK`，220 ≈ -43.5dBFS 峰值）—— 那个门限是给
+   30s 长静音闸门定的，低到把**房间噪声**也算成「有人在说」：实测噪声底 ≥ -50dBFS 时，
+   静音块的峰值中位数就有 363 > 220 → `user_quiet_s()` 被噪声持续刷新、恒 ~0.1s，
+   快路径在真麦克风上**静默失效**（同型故障，换了个死法）。
+
+**为什么以前测不出来**：喂给采集泵的「静音」是**全零**（数字静音，峰值恒为 0），
+而真实麦克风在没人说话时送的是**带噪声底的房间声**。所以本文件里的静音一律用
+**噪声**（默认 -50dBFS，接近本机实测用户那台 USB 麦的底噪 -48.9dBFS），并让判据先
+暖一段噪声底再喂「说话」——这两件事正是把上面第 2 条钉死的钉子。
+
+判据本体在 `vlt/voice_activity.py`，单元用例在 `tests/test_voice_activity.py`。
 """
 from __future__ import annotations
 
@@ -25,20 +35,41 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from vlt.session.base import (DEFAULT_FAST_FINAL_SILENCE_S,      # noqa: E402
+from vlt.engine import SILENCE_PEAK                                # noqa: E402
+from vlt.session.base import (DEFAULT_FAST_FINAL_SILENCE_S,       # noqa: E402
                               DEFAULT_FAST_FINAL_USER_QUIET_S,
                               DEFAULT_FINAL_SILENCE_S, SessionConfig, should_finalize)
-from vlt.session.qwen38 import QwenLiveTranslateSession          # noqa: E402
+from vlt.session.qwen38 import QwenLiveTranslateSession           # noqa: E402
 
 CHUNK_SAMPLES = 1600                       # 100ms @16k 单声道
+QUIET_CHUNKS = 20                          # 开场 2.0s 房间噪声（暖噪声底 = voice_activity 的预热）
 SPEECH_CHUNKS = 10                         # 1.0s 说话
-SILENCE_CHUNKS = 30                        # 之后 3.0s 不说话
+SILENCE_CHUNKS = 30                        # 之后 3.0s 房间噪声
+NOISE_DB = -50.0                           # 房间噪声底（本机实测用户那台麦 ≈ -48.9dBFS）
+SPEECH_DB = -25.0                          # 说话电平（比底噪高 25dB）
+_RNG = np.random.default_rng(20261004)
 _TONE = b"".join(struct.pack("<h", int(3000 * math.sin(2 * math.pi * 440 * i / 16000)))
                  for i in range(CHUNK_SAMPLES))
-_SIL = b"\x00\x00" * CHUNK_SAMPLES
+
+
+def _noise(floor_db: float = NOISE_DB) -> bytes:
+    sigma = 32768.0 * (10.0 ** (floor_db / 20.0))
+    return _RNG.normal(0, sigma, CHUNK_SAMPLES).astype("<i2").tobytes()
+
+
+def _speech(level_db: float = SPEECH_DB) -> bytes:
+    t = np.arange(CHUNK_SAMPLES) / 16000.0
+    amp = 32768.0 * (10.0 ** (level_db / 20.0)) * math.sqrt(2.0)
+    return (np.sin(2 * math.pi * 220.0 * t) * amp).astype("<i2").tobytes()
+
+
+def _peak_of(pcm: bytes) -> int:
+    return int(np.abs(np.frombuffer(pcm, dtype="<i2")).max())
 
 
 def _fmt(sec: float | None) -> str:
@@ -120,13 +151,15 @@ class _FakeEngine:
 
 
 def test_proxy_reports_voice_by_level() -> bool:
-    """★ 核心回归：信号必须来自**电平**，不是「距上次上送音频的间隔」。
+    """★ 核心回归：信号必须来自**相对噪声底的电平**。
 
-    真实 `_SessionProxy` 喂「一块响 + 连着一串静音」：
-      - 响的那块之后 `user_quiet_s()` 很小（证明电平信号到了会话）；
-      - 之后**静音块照样在往上送**时，`user_quiet_s()` 必须**继续变大** ——
-        若哪天有人把它改回「上送间隔」，这里就会变成恒 ~0.0s（把静音当「还在说话」），
-        或者反过来永远不触发快路径。
+    真实 `_SessionProxy` + **真实房间噪声**（不是全零）：
+      - 预热期（前 2s）不算「听到人声」→ `user_quiet_s()` 仍是 `None`（保守）；
+      - 喂一串「说话」→ `user_quiet_s()` 很小（信号到了会话）；
+      - 接着喂**噪声**（真实麦克风腿就是这样：没人说话也每 100ms 送一块）→
+        `user_quiet_s()` 必须**继续变大**。若哪天有人把判据改回固定峰值门限
+        （`peak >= SILENCE_PEAK`），这些噪声块会被当成「有人在说」，
+        这个值就会恒 ~0.0s（用例立刻红）。
     """
     from vlt.engine import _SessionProxy
 
@@ -138,33 +171,53 @@ def test_proxy_reports_voice_by_level() -> bool:
         eng._session = sess
         proxy = _SessionProxy(eng)
 
-        # ① 从未说过话 → None（按「已静」看待）
+        # ① 从未说过话 → None（按「已静」看待，判据那边走慢路径）
         cond = sess.user_quiet_s() is None
         print(f"  没说过话时 user_quiet_s() = {sess.user_quiet_s()}（期望 None）  {'OK' if cond else '✗'}")
         ok &= cond
 
-        # ② 一块「响」→ 会话收到「有人在说」
-        await proxy.send_audio(_TONE)
-        q = sess.user_quiet_s()
-        cond = q is not None and q < 0.2
-        print(f"  喂一块响的 → user_quiet_s()={_fmt(q)}（期望 <0.2s）  {'OK' if cond else '✗'}")
+        # ② 预热期：20 块房间噪声（2.0s）。噪声底还没学出来 → 不许上报「有人说话」
+        for _ in range(QUIET_CHUNKS):
+            await proxy.send_audio(_noise())
+        cond = sess.user_quiet_s() is None
+        print(f"  预热期喂 {QUIET_CHUNKS} 块房间噪声（{QUIET_CHUNKS / 10:.1f}s）→ "
+              f"user_quiet_s()={_fmt(sess.user_quiet_s())}（期望 None：占位不算听到人声）"
+              f"  {'OK' if cond else '✗'}")
         ok &= cond
 
-        # ③ 接着连喂静音块（真实麦克风腿就是这样：不说话也每 100ms 送一块）
+        # ③ 一层「说话」——底噪 +25dB
         for _ in range(5):
-            await proxy.send_audio(_SIL)
+            await proxy.send_audio(_speech())
+        q = sess.user_quiet_s()
+        cond = q is not None and q < 0.2
+        print(f"  喂 5 块说话（底噪 +25dB）→ user_quiet_s()={_fmt(q)}（期望 <0.2s）  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        # ④ 接着连喂**噪声**块（真实麦克风腿就是这样：不说话也每 100ms 送一块）
+        for _ in range(6):
+            await proxy.send_audio(_noise())
             await asyncio.sleep(0.1)
         q = sess.user_quiet_s()
         cond = q is not None and q >= 0.4
-        print(f"  之后 0.5s 全是静音块（仍在往上送）→ user_quiet_s()={_fmt(q)}"
-              f"（期望 ≥0.4s：静音就该长）  {'OK' if cond else '✗'}")
+        print(f"  之后 0.6s 全是房间噪声（仍在往上送）→ user_quiet_s()={_fmt(q)}"
+              f"（期望 ≥0.4s：噪声就该算「静」）  {'OK' if cond else '✗'}")
         ok &= cond
 
-        # ④ 又响了一块 → 重新计时
-        await proxy.send_audio(_TONE)
+        # ⑤ 钉住「为什么不能用固定峰值门限」：同一批噪声块在 220 门限下全是「有人在说」
+        noise_peaks = [_peak_of(_noise()) for _ in range(20)]
+        loud = sum(1 for p in noise_peaks if p >= SILENCE_PEAK)
+        cond = loud >= 15
+        print(f"  同一批房间噪声块：峰值中位 {sorted(noise_peaks)[10]}，"
+              f"其中 {loud}/20 块 ≥ SILENCE_PEAK({SILENCE_PEAK}) → 固定峰值门限会把噪声")
+        print(f"    全当成「有人在说」→ user_quiet_s() 恒 ~0、快路径静默失效"
+              f"（这就是必须相对噪声底的原因）  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        # ⑥ 再喂一块说话 → 重新计时
+        await proxy.send_audio(_speech())
         q = sess.user_quiet_s()
         cond = q is not None and q < 0.2
-        print(f"  再喂一块响的 → user_quiet_s()={_fmt(q)}（期望 <0.2s）  {'OK' if cond else '✗'}")
+        print(f"  再喂一块说话的 → user_quiet_s()={_fmt(q)}（期望 <0.2s）  {'OK' if cond else '✗'}")
         ok &= cond
         return ok
 
@@ -172,23 +225,25 @@ def test_proxy_reports_voice_by_level() -> bool:
 
 
 class _FakeSource:
-    """按实时节奏吐块（100ms 一块，先响后静）；静音期间**照样**有块。"""
+    """按实时节奏吐块（100ms 一块）：先暖噪声底，再说话，之后一直是房间噪声。"""
 
     rate = 16000
     channels = 1
 
     def __init__(self) -> None:
-        self.seq = [_TONE] * SPEECH_CHUNKS + [_SIL] * SILENCE_CHUNKS
+        self.seq = ([_noise() for _ in range(QUIET_CHUNKS)]
+                    + [_speech() for _ in range(SPEECH_CHUNKS)]
+                    + [_noise() for _ in range(SILENCE_CHUNKS)])
         self.i = 0
         self.speech_end_at: float | None = None
 
     async def read(self, timeout: float = 1.0):
         await asyncio.sleep(0.1)
         if self.i >= len(self.seq):
-            return _SIL                     # 采集流不会停：一直有静音块（真实麦克风就是这样）
+            return _noise()                 # 采集流不会停：一直有房间噪声（真实麦克风就是这样）
         chunk = self.seq[self.i]
         self.i += 1
-        if self.i == SPEECH_CHUNKS:         # 刚送完最后一块「说话」
+        if self.i == QUIET_CHUNKS + SPEECH_CHUNKS:      # 刚送完最后一块「说话」
             self.speech_end_at = time.perf_counter()
         return chunk
 
@@ -196,8 +251,11 @@ class _FakeSource:
         return None
 
 
+E2E_WATCHDOG_S = 7.0
+
+
 def _run_e2e(fast_silence_s: float | None) -> tuple[float, float, float | None] | None:
-    """真链路复刻：`_pump_capture` 喂「1s 说话 + 3s 静音」+ 真实 `tick()`。
+    """真链路复刻：`_pump_capture` 喂「2s 噪声 + 1s 说话 + 噪声」+ 真实 `tick()`。
 
     返回 (说完 → 封句的秒数, 封句瞬间文字静默, 封句瞬间上游静默)。
     """
@@ -219,9 +277,10 @@ def _run_e2e(fast_silence_s: float | None) -> tuple[float, float, float | None] 
                 finals.append((now, now - sess._last_text_at, sess.user_quiet_s(now)))
 
         sess.on_text = on_text
-        # 模拟「服务端已经把译文吐完了」：最后一条增量就在起跑线上
+        # 模拟「服务端已经把译文吐完了」：文本已累计，但**时间戳留到说话结束再打**
+        # （真机时间线：最后一条增量在说完前 0.74~0.89s 到齐；若在这里就打时间戳，
+        #   慢路径会先于快路径触发，测的就不是快路径了）。
         sess._buf = ["你好，世界。"]
-        sess._last_text_at = time.perf_counter()
 
         source = _FakeSource()
         stop = threading.Event()
@@ -237,7 +296,7 @@ def _run_e2e(fast_silence_s: float | None) -> tuple[float, float, float | None] 
                 await asyncio.sleep(0.1)
 
         async def watchdog() -> None:
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(E2E_WATCHDOG_S)
             stop.set()
 
         tk = asyncio.create_task(ticker())
@@ -255,7 +314,7 @@ def _run_e2e(fast_silence_s: float | None) -> tuple[float, float, float | None] 
 
 
 def test_end_to_end_fast_path() -> bool:
-    """★ 端到端：走真实采集泵（静音块持续上送）时，快路径**真的**要生效。"""
+    """★ 端到端：走真实采集泵（房间噪声持续上送）时，快路径**真的**要生效。"""
     ok = True
     got = _run_e2e(DEFAULT_FAST_FINAL_SILENCE_S)
     if got is None:
@@ -287,10 +346,12 @@ def test_end_to_end_fast_path() -> bool:
 def test_config_parsing() -> bool:
     """配置口径：非法值**留痕 + 回落默认值**（不许静默关掉）；`null` 才是明确关掉。"""
     ok = True
-    import io
     import contextlib
+    import io
 
     from vlt.config import _float_or_default, _opt_float
+    from vlt.engine import voice_margin_settings
+    from vlt.voice_activity import DEFAULT_VOICE_MARGIN_DB
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -313,6 +374,20 @@ def test_config_parsing() -> bool:
     cond = got == DEFAULT_FAST_FINAL_USER_QUIET_S and "⚠️" in buf.getvalue()
     print(f"  fast_final_user_quiet_s='abc' → {got}（期望回落默认值）+ 留痕  {'OK' if cond else '✗'}")
     ok &= cond
+
+    # 判据余量：缺省/null 用默认；越界或非数字留痕 + 回落默认（不许静默带病运行）
+    cond = voice_margin_settings({}) == DEFAULT_VOICE_MARGIN_DB
+    cond &= voice_margin_settings({"fast_final_voice_margin_db": None}) == DEFAULT_VOICE_MARGIN_DB
+    cond &= voice_margin_settings({"fast_final_voice_margin_db": 6}) == 6.0
+    print(f"  fast_final_voice_margin_db：缺省/null → 默认 {DEFAULT_VOICE_MARGIN_DB}，6 → 6.0  "
+          f"{'OK' if cond else '✗'}")
+    ok &= cond
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        bad = voice_margin_settings({"fast_final_voice_margin_db": 99})
+    cond = bad == DEFAULT_VOICE_MARGIN_DB and "⚠️" in buf.getvalue()
+    print(f"  fast_final_voice_margin_db=99 → {bad}（越界回落默认）+ 留痕  {'OK' if cond else '✗'}")
+    ok &= cond
     return ok
 
 
@@ -321,7 +396,7 @@ if __name__ == "__main__":
     results = [
         ("纯函数判据表", test_pure_table()),
         ("纯函数边界", test_pure_edges()),
-        ("代理按电平上报（真实 _SessionProxy）", test_proxy_reports_voice_by_level()),
+        ("代理按电平上报（真实 _SessionProxy + 真实房间噪声）", test_proxy_reports_voice_by_level()),
         ("端到端（真实采集泵 + tick）", test_end_to_end_fast_path()),
         ("配置解析", test_config_parsing()),
     ]
